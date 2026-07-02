@@ -94,12 +94,19 @@ inline void populateRedfishFromPending(
     }
     for (const auto& [name, pendingAttribute] : pendingAttributes)
     {
-        bios_utils::addAttribute(
-            attributes, name,
+        // Convert the AttributeType enum back to its dotted string form so
+        // addAttribute can look it up in its typeMap.
+        const bios_utils::AttributeType enumType =
             std::get<uint(bios_utils::PendingAttributeValueIndex::Type)>(
-                pendingAttribute),
+                pendingAttribute);
+        dbus::utility::DbusVariantType typeAsDbusVariant =
+            bios_utils::attributeTypeToString(enumType);
+        dbus::utility::DbusVariantType valueAsDbusVariant = std::visit(
+            [](const auto& v) -> dbus::utility::DbusVariantType { return v; },
             std::get<uint(bios_utils::PendingAttributeValueIndex::Value)>(
                 pendingAttribute));
+        bios_utils::addAttribute(attributes, name, typeAsDbusVariant,
+                                 valueAsDbusVariant);
     }
 }
 
@@ -107,41 +114,37 @@ inline void updatePendingAttribute(
     bios_utils::PendingAttributes& pendingAttributes, const std::string& name,
     bios_utils::PendingAttributeValue attributeValue)
 {
-    auto it =
-        std::ranges::find(pendingAttributes, name,
-                          &bios_utils::PendingAttributes::value_type::first);
-    if (it != pendingAttributes.end())
-    {
-        it->second = std::move(attributeValue);
-        return;
-    }
-    pendingAttributes.emplace_back(name, std::move(attributeValue));
+    pendingAttributes.insert_or_assign(name, std::move(attributeValue));
 }
 
 inline bool populatePendingFromRedfish(
     bios_utils::PendingAttributes& pendingAttributes,
-    const nlohmann::json::object_t& jsonAttributes, crow::Response& response)
+    const nlohmann::json::object_t& jsonAttributes, const BaseTable& baseTable,
+    crow::Response& response)
 {
     for (const auto& [name, value] : jsonAttributes)
     {
+        // Look up the attribute type from BaseBIOSTable so we send exactly
+        // the type the daemon expects.  The daemon rejects any mismatch.
+        auto baseIter = baseTable.find(name);
+        if (baseIter == baseTable.end())
+        {
+            BMCWEB_LOG_ERROR("Attribute {} not found in BaseBIOSTable", name);
+            messages::propertyValueNotInList(response, name, "Attributes");
+            return false;
+        }
+        const std::string& typeStr =
+            std::get<uint(BaseTableAttributeIndex::Type)>(baseIter->second);
+        bios_utils::AttributeType attrType =
+            bios_utils::attributeTypeFromString(typeStr);
+
         const std::string* strValue = value.get_ptr<const std::string*>();
         if (strValue != nullptr)
         {
             updatePendingAttribute(
                 pendingAttributes, name,
-                std::make_tuple("xyz.openbmc_project.BIOSConfig.Manager."
-                                "AttributeType.String",
-                                *strValue));
-            continue;
-        }
-        const bool* boolValue = value.get_ptr<const bool*>();
-        if (boolValue != nullptr)
-        {
-            updatePendingAttribute(
-                pendingAttributes, name,
-                std::make_tuple("xyz.openbmc_project.BIOSConfig."
-                                "Manager.AttributeType.Boolean",
-                                *boolValue));
+                std::make_tuple(attrType,
+                                std::variant<int64_t, std::string>(*strValue)));
             continue;
         }
         const int64_t* intValue = value.get_ptr<const int64_t*>();
@@ -149,9 +152,8 @@ inline bool populatePendingFromRedfish(
         {
             updatePendingAttribute(
                 pendingAttributes, name,
-                std::make_tuple("xyz.openbmc_project.BIOSConfig.Manager."
-                                "AttributeType.Integer",
-                                *intValue));
+                std::make_tuple(attrType,
+                                std::variant<int64_t, std::string>(*intValue)));
             continue;
         }
 
@@ -285,10 +287,11 @@ inline void handlePendingBiosGet(
 inline void handlePendingBiosPatchAttributes(
     const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
     const nlohmann::json::object_t& jsonAttributes,
-    const bios_utils::PendingAttributes& currentPendingAttributes)
+    const bios_utils::PendingAttributes& currentPendingAttributes,
+    const BaseTable& baseTable)
 {
     bios_utils::PendingAttributes pendingAttributes = currentPendingAttributes;
-    if (!populatePendingFromRedfish(pendingAttributes, jsonAttributes,
+    if (!populatePendingFromRedfish(pendingAttributes, jsonAttributes, baseTable,
                                     asyncResp->res))
     {
         return;
@@ -299,15 +302,32 @@ inline void handlePendingBiosPatchAttributes(
                         "PendingAttributes", pendingAttributes));
 }
 
+inline void handlePendingBiosManagerObjectForPatchWithBase(
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    const nlohmann::json::object_t& jsonAttributes,
+    const bios_utils::PendingAttributes& currentPendingAttributes,
+    const BaseTable& baseTable)
+{
+    handlePendingBiosPatchAttributes(asyncResp, jsonAttributes,
+                                     currentPendingAttributes, baseTable);
+}
+
 inline void handlePendingBiosManagerObjectForPatch(
     const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
     const nlohmann::json::object_t& jsonAttributes,
     const std::string& objectPath)
 {
+    // Fetch PendingAttributes first, then BaseBIOSTable, then patch.
     bios_utils::getBIOSManagerProperty<bios_utils::PendingAttributes>(
         asyncResp, "PendingAttributes", objectPath,
-        std::bind_front(handlePendingBiosPatchAttributes, asyncResp,
-                        jsonAttributes));
+        [asyncResp, jsonAttributes, objectPath](
+            const bios_utils::PendingAttributes& currentPendingAttributes) {
+            bios_utils::getBIOSManagerProperty<BaseTable>(
+                asyncResp, "BaseBIOSTable", objectPath,
+                std::bind_front(handlePendingBiosManagerObjectForPatchWithBase,
+                                asyncResp, jsonAttributes,
+                                currentPendingAttributes));
+        });
 }
 
 inline void handlePendingBiosPatch(

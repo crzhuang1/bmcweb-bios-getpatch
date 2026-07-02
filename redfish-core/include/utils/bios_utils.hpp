@@ -8,9 +8,12 @@
 #include "error_messages.hpp"
 #include "logging.hpp"
 
+#include <sdbusplus/message/native_types.hpp>
+
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -18,7 +21,6 @@
 #include <unordered_map>
 #include <utility>
 #include <variant>
-#include <vector>
 
 namespace redfish
 {
@@ -142,8 +144,57 @@ inline void getBIOSManagerObject(
         });
 }
 
+// Matches the D-Bus interface exactly:
+//   property type: a{s(se)}  where the variant is restricted to
+//   std::variant<int64_t, std::string> and the type tag is the
+//   AttributeType sdbusplus enum (serialised as its dotted string form).
+//
+// The enum and its sdbusplus serialization specializations replicate
+// xyz/openbmc_project/BIOSConfig/Manager/common.hpp, which is not available
+// in all bmcweb build sysroots.
+enum class AttributeType
+{
+    Enumeration,
+    String,
+    Password,
+    Integer,
+    Boolean,
+};
+
+inline AttributeType attributeTypeFromString(const std::string& s)
+{
+    if (s == "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.Enumeration")
+        return AttributeType::Enumeration;
+    if (s == "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.Integer")
+        return AttributeType::Integer;
+    if (s == "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.Boolean")
+        return AttributeType::Boolean;
+    if (s == "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.Password")
+        return AttributeType::Password;
+    // Default to String for unknown types
+    return AttributeType::String;
+}
+
+inline std::string attributeTypeToString(AttributeType e)
+{
+    switch (e)
+    {
+        case AttributeType::Enumeration:
+            return "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.Enumeration";
+        case AttributeType::String:
+            return "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.String";
+        case AttributeType::Password:
+            return "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.Password";
+        case AttributeType::Integer:
+            return "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.Integer";
+        case AttributeType::Boolean:
+            return "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.Boolean";
+    }
+    return "";
+}
+
 using PendingAttributeValue =
-    std::tuple<std::string, dbus::utility::DbusVariantType>;
+    std::tuple<AttributeType, std::variant<int64_t, std::string>>;
 enum class PendingAttributeValueIndex
 {
     Type = 0,
@@ -151,27 +202,100 @@ enum class PendingAttributeValueIndex
 };
 
 using PendingAttributes =
-    std::vector<std::pair<std::string, PendingAttributeValue>>;
+    std::map<std::string, PendingAttributeValue>;
+
+inline std::string pendingAttributeValueToStringCrystalDebug(
+    const std::variant<int64_t, std::string>& value)
+{
+    return std::visit(
+        [](const auto& v) -> std::string {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::same_as<T, std::string>)
+            {
+                return v;
+            }
+            else
+            {
+                return std::to_string(v);
+            }
+        },
+        value);
+}
 
 inline void setBIOSManagerProperty(
     const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
     const std::string& propertyName, const PendingAttributes& propertyValue,
     const std::string& objectPath)
 {
+    BMCWEB_LOG_DEBUG(
+        "crystal debug: setting BIOS manager property '{}' on object '{}' interface '{}' entries={}",
+        propertyName, objectPath, biosConfigManagerInterface,
+        propertyValue.size());
+    for (const auto& [name, pendingValue] : propertyValue)
+    {
+        BMCWEB_LOG_DEBUG(
+            "crystal debug: pending attribute name='{}' type='{}' value='{}'",
+            name, attributeTypeToString(std::get<0>(pendingValue)),
+            pendingAttributeValueToStringCrystalDebug(std::get<1>(pendingValue)));
+    }
+
     sdbusplus::asio::setProperty(
         *crow::connections::systemBus, objectPath,
         std::string(biosConfigManagerPath),
         std::string(biosConfigManagerInterface), propertyName, propertyValue,
-        [asyncResp, propertyName](const boost::system::error_code& ec) {
+        [asyncResp, propertyName,
+         objectPath](const boost::system::error_code& ec) {
             if (ec)
             {
-                BMCWEB_LOG_ERROR("DBus response error for setting {}: {}",
-                                 propertyName, ec);
+                BMCWEB_LOG_ERROR(
+                    "crystal debug: DBus response error for setting '{}' on object '{}': value={} category='{}' message='{}'",
+                    propertyName, objectPath, ec.value(), ec.category().name(),
+                    ec.message());
                 messages::internalError(asyncResp->res);
                 return;
             }
+            BMCWEB_LOG_DEBUG(
+                "crystal debug: successfully set BIOS manager property '{}' on object '{}'",
+                propertyName, objectPath);
         });
 }
 
 } // namespace bios_utils
 } // namespace redfish
+
+// Teach sdbusplus how to serialize/deserialize our local AttributeType enum
+// over D-Bus (it is treated as SD_BUS_TYPE_STRING on the wire).
+namespace sdbusplus::message::details
+{
+
+template <>
+struct convert_to_string<redfish::bios_utils::AttributeType>
+{
+    static std::string op(redfish::bios_utils::AttributeType e)
+    {
+        return redfish::bios_utils::attributeTypeToString(e);
+    }
+};
+
+template <>
+struct convert_from_string<redfish::bios_utils::AttributeType>
+{
+    static std::optional<redfish::bios_utils::AttributeType>
+        op(const std::string& s) noexcept
+    {
+        using AT = redfish::bios_utils::AttributeType;
+        if (s == "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.Enumeration")
+            return AT::Enumeration;
+        if (s == "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.String")
+            return AT::String;
+        if (s == "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.Password")
+            return AT::Password;
+        if (s == "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.Integer")
+            return AT::Integer;
+        if (s == "xyz.openbmc_project.BIOSConfig.Manager.AttributeType.Boolean")
+            return AT::Boolean;
+        return std::nullopt;
+    }
+};
+
+} // namespace sdbusplus::message::details
